@@ -1,0 +1,455 @@
+=head1 NAME 
+
+Binary - Parse files into perl structures
+
+=head1 SYNOPSIS
+
+  open (my $fh, "<:raw", '/path/to/file') or die "$!";
+  
+  my ($filedata, $fh) = Binary::eat_desc([ $fh ], [
+    version      => 's>',
+    color        => \&eat_rgbcolor,
+    must_be_1    => sub { Binary::eat_required(shift, 'l>', 1, 'Not 1, ohnoes!') },
+    len_then_str => sub { Binary::eat_counted_string(shift, 'l>') },
+    dualvar_n    => sub { Binary::eat_enum(shift, 'l>', [qw/absolute relative/] ) },
+  ]);    
+
+=head1 DESCRIPTION
+
+This module provides a set of functions to extract data from binary
+files. These can be combined sequentially to extract data as a set of
+fields and return a perl data structure.
+
+Each function reads data from a filehandle using a given data
+description, and returns it.
+
+All functions (except L</eat_at>) expect the filehandle's position
+marker to be at the appropriate place in the file to read data
+matching the given rule.
+
+Binary is built around L<perlfunc:unpack>. Ultimately, all calls are
+devolved into calling C<unpack> on a string of data read from a
+file. The L</eat_desc> function can be called to directly run a given
+C<unpack> template.
+
+You may add your own local functions to call using Binary, or use
+functions from other Binary derived modules.
+
+=head2 Common arguments
+
+(Almost) all Binary functions take the same first argument, refered to
+in the descriptions of individual functions as C<$conventional>.  This is
+an arrayref to keep the calling convention concise, while allowing
+later versions to add more conventional parameters without breaking
+existing code.  The elements of the arrayref are as follows:
+
+=over
+
+=item $fh
+
+The first element of $conventional is a filehandle.  The filehandle's
+position marker is expected to be set to the correct byte in the file
+to read the required data from.  (Except for L</eat_at>.)
+
+The "filehandle" can also be a scalar containing a string. Reading
+the next value from a scalar always reads from the beginning of the
+string, using substr.
+
+After the function returns, the passed in filehandle will have its
+position marker set to the point after the read value.
+
+=item $context
+
+The second element of $conventional is the context.  As a user, this
+is generally optional.  The exact definition of the context varies
+from function to function; if not noted in the documentation for each
+function, below, then the function will pass on it's context to
+lower-level calls.
+
+=item $str_context
+
+A string representation of the current position in the file format tree.
+
+=back
+
+=head2 Return values
+
+All functions return the requested value.
+
+=head2 Functions
+
+=head3 eat_desc
+
+=over
+
+=item Arguments: $conventional, $desc
+
+=back
+
+This is the primary function to call to define a structure to be read from a file. 
+
+The C<$desc> argument describes the format of the data to be
+extracted, it can be one of several different types of description:
+
+=over
+
+=item Arrayref
+
+  Binary::eat_desc($conventional, [
+    version      => 's>',
+    color        => \&eat_rgbcolor,
+    must_be_1    => sub { Binary::eat_required(shift, 'l>', 1, 'Not 1, ohnoes!') },
+    len_then_str => sub { Binary::eat_counted_string(shift, 'l>') },
+    dualvar_n    => sub { Binary::eat_enum(shift, 'l>', [qw/absolute relative/] ) },
+  ]);
+
+To extract a set of information from the file, pass an arrayref of
+key/value pairs. An arrayref is used instead of a hashref, as
+ordering is important. Each "key" is the name of a field, each "value"
+describes how the data should be written. C<eat_desc> is called with
+the "values" and the result is returned as a hasref using the "keys".
+
+For ease of dumping, each "key" will be present in the returned
+hashref both as itself, and as an element named "$n.$name", where $n
+starts at zero and is ++ed with every element.  Additionally, there
+will be an element _context, which gives the context passed in
+$conventional.
+
+The arrayref passed in is guaranteed to remain in its original state
+after the function returns.
+
+Thus, the return of the above call might be:
+
+  {
+   version => 4,
+   color => [255 255 255],
+   must_be_1 => 1,
+   len_then_str => 'example',
+   dualvar_n => dualvar(1, 'relative')
+  }
+
+The context passed to the "value" is the same hashref that will
+eventually be returned from the outer eat_desc.
+
+=item Coderef
+
+  Binary::eat_desc($conventional, \&eat_rgbcolor);
+  
+  Binary::eat_desc($conventional, 
+                   [
+                    version => 'C',
+                    only_in_new => sub {
+                     my ($conventional) = @_;
+                     my ($fh, $context) = $@conventional;
+                     if ($context->{version} > 2) {
+                        return Binary::eat_desc($conventional, 'C');
+                     } else {
+                        return (1, $fh);
+                     }
+                    }
+                   ]
+                  );
+
+The coderef is called, passing in a C<$conventional>. The results are returned
+to the calling code.
+
+=item Pack template
+
+  Binary::eat_desc($conventional, 'l>');
+
+Each pack template has an implicit length, see L<perlfunc:pack>. The
+number of bytes assigned to the chosen pack template is read from the
+filehandle, then L<perlfunc:unpack>ed and returned.
+
+=item Pack template with count
+
+  Binary::eat_desc($conventional, 'l>2');
+
+Returns an arrayref of results, produced by calling C<eat_desc> the
+number of times requested. The allowed pack templates are the same as
+L</Pack template>.
+
+For the example given, the result would contain the next two B<< l> >>
+values from the filehandle.
+
+=item a or Z pack template with specifc length
+
+  Binary::eat_desc($conventional, 'a6');
+
+L<perlfunc:unpack>s the given number of bytes from the file using the
+specfied pack template. Only I<a> and I<Z> are allowed.
+
+=item Z*
+
+The literal description B<Z*> will read a null-terminated string from
+the filehandle, including the null. The result is returned after being
+L<decode|Encode>ed from I<ascii>.
+
+=item a*
+
+I<Only supported with scalar filehandles>.
+
+Return the entire rest of the filehandle.
+
+=back
+
+=head3 eat_unpack
+
+=over
+
+=item Arguments: \@conventional, $template, $len
+
+=back
+
+  Binary::eat_unpack($conventional, 'l>', 8);
+
+This function is called by L</eat_desc> to retrieve data from the
+filehandle and actually L<perlfunc:unpack> it.
+
+Arguments:
+
+=over
+
+=item $template
+
+Any template recognised by L<perlfunc:pack>.
+
+=item $len
+
+The number of bytes to read from the filehandle.
+
+=back
+
+Think about using L</eat_desc> before using this function, as it has
+pre-defined sensible lengths for each pack template, to extract number
+data.
+
+=head3 eat_required
+
+=over
+
+=item Arguments: \@conventional, $desc, $should_be, [$error]
+
+=back
+
+  Binary::eat_required($conventional, 'a4', 'fred', "Can't find fred");
+
+This function works similarly to L</eat_desc>, which it uses to fetch
+the content from the file using the C<$desc> argument. The difference
+is that it throws an exception if the content fetched does not match
+the value passed in C<$should_be> (according to perl's smart match
+semantics, see L<perlsyn:Smart Matching in Detail>).
+
+For how to use the C<$desc> parameter, see L</eat_desc>.
+
+=head3 eat_encoded_str
+
+=over
+
+=item Arguments: \@conventional, $byte_len, $encoding, $chop_zeroes
+
+=back
+
+  Binary::eat_encoded_str($conventional,  4, 'utf-8', 0);
+
+Retrieve C<$byte_len> bytes from the file handle,
+L<decode|Encode::decode> them using the given C<$encoding>.
+
+If C<$chop_zeroes> is true, the result will be returned with all
+trailing nulls removed.
+
+=head3 eat_utf16be_null
+
+=over
+
+=item Arguments: \@conventional
+
+=back
+
+  Binary::eat_utf16be_null($conventional); 
+
+Reads utf16be (big endian) characters in 2-byte chunks from the
+filehandle and decodes them. Returns the entire string found when a
+null word is encountered.
+
+=head3 eat_pad_until
+
+=over
+
+=item Arguments: \@conventional, $mul, $ofs
+
+=back
+
+  Binary::eat_pad_until($conventional, 1, 4);
+
+Keep removing bytes until the filehandle position reaches the next
+multiple of C<$mul>, plus C<$ofs> (offset).
+
+This is useful in situations where files consist of sections of a set
+length (C<$mul>), which are padded at the end with random padding. Use
+C<$ofs> if you wish to skip some of the beginning of the next section.
+
+C<$ofs> defaults to 0 if not supplied.
+
+Returns the bytes read, if any.
+
+=head3 eat_until_eof
+
+=over
+
+=item Arguments: \@conventional, $desc
+
+=back
+
+  Binary::eat_until_eof($conventional, 'l>'
+
+Read C<$desc> from the filehandle repeatedly until the end-of-file
+marker is reached. See L</eat_desc> for an explanation of the C<$desc>
+argument.
+
+Outputs a warning if the file unexpectedly runs out of bytes in the
+middle of a C<$desc>.
+
+Returns an arrayref containing all the results of the repeated
+L</eat_desc> calls.
+
+=head3 eat_at
+
+=over
+
+=item Arguments: \@conventional, $pos, $desc
+
+=back
+
+This is the only function which does not read from the current
+filehandle position. The C<$desc> description is read from the C<$pos>
+position in the filehandle.
+
+The original filehandle position is restored after the value has been
+read.
+
+For a description of C<$desc>, see L</eat_desc>.
+
+=head3 eat_zero_len
+
+=over
+
+=item Arguments: \@conventional, $desc
+
+=back
+
+  Binary::eat_zero_len([ $fh ], 'l>');
+
+Works exactly like L</eat_desc> but the filehandle marker is returned
+to the same position it was at the start of the read.
+
+This is handy for testing the next value in the file without
+officially reading it.
+
+=head3 eat_counted_string
+
+=over
+
+=itemm Arguments: \@conventional, $count_desc
+
+=back
+
+  Binary::eat_counted_string([ $fh ], 'n');
+
+Reads a string from the filehandle using C<$count_desc> as a template
+to define the field containing the length of the string.
+
+It actually first reads the string length from from the filehandle,
+using C<$count_desc> as a template for L</eat_desc>. The result of
+that read is then used to fetch that number of bytes from the
+filehandle and return them, using L</Pack template with count>.
+
+=head3 eat_bitmask
+
+=over
+
+=item Arguments: \@conventional, $desc, %values
+
+=back
+
+  Binary::eat_bitmask([ $fh ], .. );
+
+=head3 eat_enum
+
+=over
+
+=item Arguments: \@conventional, $desc, \%values | \@values
+
+=back
+
+  Binary::eat_enum([ $fh ], 
+    sub { Binary::eat_counted_string(shift, 'n') },
+    [ 'red', 'blue' ]
+  );
+
+Read the next C<$desc> item from the filehandle. Looks up the
+resulting value in C<$values>, using it as an index if C<$values> is
+an arrayref, and as a key if C<$values> is a hashref.
+
+Returns the resulting value as a L<Scalar::Util/dualvar> with both the
+raw value retrieved and the result of the lookup.
+
+See L</eat_desc> for the definition of C<$desc>.
+
+=head3 eat_counted
+
+=over
+
+=item Arguments: \@conventional, $count, $desc
+
+=back
+
+  Binary::eat_counted([ $fh ], 4, 'a');
+
+Retrieves the C<$desc> from the filehandle, via L</eat_desc>,
+C<$count> times. The result is returned as an array with C<$count>
+items in it.
+
+=head1 EXAMPLES
+
+=head2 Four bytes of arbitrary data
+
+  open(my $fh, '<', \'fred');
+  Binary::eat_desc([$fh], 'a4');
+
+Result: 'fred'
+
+=head2 One byte of arbitrary data, four times
+
+  open(my $fh, '<', \'fred');
+  Binary::eat_counted([$fh], 4, 'a');
+
+Result: ['f', 'r', 'e', 'd']
+
+=head2 Read the string size then the string
+
+  open(my $fh, '<', \"\4fred");
+  Binary::eat_counted_string([$fh], 'C');
+
+Result: 'fred'
+
+=head2 Transform numeric values into meaningful values
+
+  open(my $fh, '<', \"\1\4\2");
+
+  Binary::eat_counted([$fh], 
+   3, 
+   sub { Binary::eat_enum([$fh], 
+         'C', 
+         ['orange', 'red', 'green', 'blue', 'yellow']
+       ) },
+  );
+
+Result: [ dualvar(1,'red'), dualvar(4,'yellow'), dualvar(2,'green') ]
+
+=head1 BUGS
+
+=head1 LICENSE
+
+=head1 AUTHOR
+
